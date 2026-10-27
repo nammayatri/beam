@@ -18,11 +18,11 @@ module Database.Beam.Postgres.Connection
 
   , liftIOWithHandle
 
-  , runBeamPostgres, runBeamPostgresDebug
+  , runBeamPostgres, runBeamPostgresDebug, runBeamPostgresDebugLenient
 
   , pgRenderSyntax, runPgRowReader, getFields
 
-  , withPgDebug
+  , withPgDebug, withPgDebugLenient
 
   , postgresUriSyntax ) where
 
@@ -183,7 +183,13 @@ runPgRowReader conn rowIdx res fields (FromBackendRowM readRow) =
     finish x _ _ _ = pure (Right x)
 
 withPgDebug :: (Text -> IO ()) -> Pg.Connection -> Pg a -> IO (Either BeamRowReadError a)
-withPgDebug dbg conn (Pg action) =
+withPgDebug = withPgDebugWith Nothing
+
+withPgDebugLenient :: (Text -> IO ()) -> (BeamRowReadError -> IO ()) -> Pg.Connection -> Pg a -> IO (Either BeamRowReadError a)
+withPgDebugLenient dbg onSkipped = withPgDebugWith (Just onSkipped) dbg
+
+withPgDebugWith :: Maybe (BeamRowReadError -> IO ()) -> (Text -> IO ()) -> Pg.Connection -> Pg a -> IO (Either BeamRowReadError a)
+withPgDebugWith onSkipped dbg conn (Pg action) =
   let finish x = pure (Right x)
       step (PgLiftIO io next) = io >>= next
       step (PgLiftWithHandle withConn next) = withConn conn >>= next
@@ -258,6 +264,12 @@ withPgDebug dbg conn (Pg action) =
       finishProcess :: forall a. a -> Maybe PgI.Row -> IO (PgStream a)
       finishProcess x _ = pure (PgStreamDone (Right x))
 
+      skipOrStop :: forall a. BeamRowReadError -> IO (PgStream a) -> IO (PgStream a)
+      skipOrStop err continue =
+        case onSkipped of
+          Nothing -> pure (PgStreamDone (Left err))
+          Just report -> report err >> continue
+
       stepProcess :: forall a. PgF (Maybe PgI.Row -> IO (PgStream a)) -> Maybe PgI.Row -> IO (PgStream a)
       stepProcess (PgLiftIO action' next) row = action' >>= flip next row
       stepProcess (PgFetchNext next) Nothing =
@@ -267,12 +279,12 @@ withPgDebug dbg conn (Pg action) =
           Just (PgI.Row rowIdx res') ->
             getFields res' >>= \fields ->
             runPgRowReader conn rowIdx res' fields fromBackendRow >>= \case
-              Left err -> pure (PgStreamDone (Left err))
+              Left err -> skipOrStop err (stepProcess (PgFetchNext next) Nothing)
               Right r  -> next (Just r) Nothing
       stepProcess (PgFetchNext next) (Just (PgI.Row rowIdx res)) =
         getFields res >>= \fields ->
         runPgRowReader conn rowIdx res fields fromBackendRow >>= \case
-          Left err -> pure (PgStreamDone (Left err))
+          Left err -> skipOrStop err (pure (PgStreamContinue (stepProcess (PgFetchNext next))))
           Right r  -> pure (PgStreamContinue (next (Just r)))
       stepProcess (PgRunReturning _ _ _) _ = pure (PgStreamDone (Left (BeamRowReadError Nothing (ColumnErrorInternal "Nested queries not allowed"))))
       stepProcess (PgLiftWithHandle _ _) _ = pure (PgStreamDone (Left (BeamRowReadError Nothing (ColumnErrorInternal "Nested queries not allowed"))))
@@ -322,6 +334,10 @@ liftIOWithHandle f = liftF (PgLiftWithHandle f id)
 runBeamPostgresDebug :: (Text -> IO ()) -> Pg.Connection -> Pg a -> IO a
 runBeamPostgresDebug dbg conn action =
     withPgDebug dbg conn action >>= either throwIO pure
+
+runBeamPostgresDebugLenient :: (Text -> IO ()) -> (BeamRowReadError -> IO ()) -> Pg.Connection -> Pg a -> IO a
+runBeamPostgresDebugLenient dbg onSkipped conn action =
+    withPgDebugLenient dbg onSkipped conn action >>= either throwIO pure
 
 runBeamPostgres :: Pg.Connection -> Pg a -> IO a
 runBeamPostgres = runBeamPostgresDebug (\_ -> pure ())
